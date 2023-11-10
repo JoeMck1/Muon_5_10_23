@@ -1,91 +1,141 @@
-import numpy as np
 import GEVP_functions as GEVP
+import numpy as np
 
-def GEVP_eigenvalues(data, t_0, no_bs_samples):
-    
-    '''This function takes in configurations of lattice data. Where each configuration contains an nxn correlator matrix
-    at every time-slice. It then solves the generalised eigenvalue problem and returns configurations of eigenvalues, from
-    which energies can be extracted.
-    
-    t_0 is the time-slice around which the GEVP is solved. Note folding is currently assumed, thus the zeroth time-slice is
-    currently being omitted.
-    
-    no_bs_samples is the number of bootstrap samples employed.'''
+"""GEVP outline:
 
-    no_ts = int(len(data[0])/2) # number of time-slices AFTER FOLDING
-    #Bootstrapping
-    bs_configurations = GEVP.bs_mat(data, no_bs_samples) #shape = (bs_number,96,10,10)
+Starting GEVP: 
+C(t)v = lambda C(t_0)v,
 
-    #folding across time-slices 
-    folding = np.array([GEVP.fold_matrices(bs_configurations[i]) for i in range(no_bs_samples)]) #shape = (bs_number,48,10,10)
+where C(t) is the matrix of correlator, v is the eigenvector, lambda is
+the eigenvalue and C(t_0) is the correlator at time t_0.
 
-    #Symmetrizing matrices
-    symmetrization = np.array([[GEVP.matrix_symmetrizer(folding[j][i]) for i in range(no_ts)] for j in range(no_bs_samples)]) #shape = (bs_number,48,10,10)
+Decomposition:
+C(t_0) can, due to its positive-definiteness, be decomposed to
+C(t_0) = U Sigma U^T, where Sigma is a matrix with eigenvalues along
+the diagonal and U is a matrix whose columns are the normalized
+eigenvectors of C(t_0).
 
-    #Acquire average correlator matrix at time t_0 to use as reference for later reordering
-    avg_C_t0 = GEVP.C_a_t0(symmetrization, t_0)
+Algebra:
 
-    #Acquire eigenvalues and eigenvectors for C_t0's and average C_t0
-    avg_eigvals, avg_eigvecs = np.linalg.eigh(avg_C_t0)
+C(t)v = lambda U Sigma U^T v
 
-    tuple_eigvals, tuple_eigvecs = zip(*[np.linalg.eigh(symmetrization[i][t_0]) for i in range(no_bs_samples)]) # Note, these are unordered
+can be rearranged to 
 
-    #Turn tuples into arrays
-    eigvals, eigvecs = np.array(tuple_eigvals), np.array(tuple_eigvecs) # these are unordered. shape = (bs_number,10), (bs_number,10,10)
+(Sigma^(-1/2) U^T C(t) U Sigma^(-1/2)) Sigma^(1/2) U^T v
+= lambda Sigma^(1/2) U^T v
 
-    #Generate reordering templates
-    templates = np.array([GEVP.reordering_template(avg_eigvecs, eigvecs[i]) for i in range(no_bs_samples)])# shape = (bs_number,10,10)
+Redefine variables:
 
-    #Reorder the unordered C_t0 eigenvalues and eigenvectors based off the templates
-    tuple_o_eigvals, tuple_o_eigvecs = zip(*[GEVP.matrix_reorderer(templates[i], 0, eigvals[i], eigvecs[i]) for i in range(no_bs_samples)])
+let C_tilde(t) = Sigma^(-1/2) U^T C(t) U Sigma^(-1/2) and
+v_tilde = Sigma^(1/2) U^T v. Thus the GEVP has been reduced to an
+ordinary eigenvalue problem:
 
-    #Turn tuples into arrays
-    o_eigvals, o_eigvecs = np.array(tuple_o_eigvals), np.array(tuple_o_eigvecs) # shape = (bs_number,10), (bs_number,10,10)
+C_tilde(t) v_tilde = lambda v_tilde.
 
-    #Construct C tilde
-    #first we need diag{1/sqrt(eigenvalues)} 
-    diag_eigvals = np.array([np.diag(1/np.sqrt(o_eigvals[i])) for i in range(no_bs_samples)]) # shape = (bs_number,10,10)
+We the solve for lambda."""
 
-    C_tilde = np.array([np.matmul(diag_eigvals[i], np.matmul(o_eigvecs[i].T,
-                         np.matmul(symmetrization[i], np.matmul(o_eigvecs[i], diag_eigvals[i])))) for i in range(no_bs_samples)]) #shape (bs_number, 48, 10,10)
 
-    #find average C_tilde's
-    C_a_tilde = np.mean(C_tilde, axis=0) # shape = (48,10,10)
+def GEVP_eigenvalues(data, t_0, no_bs):
+    #### Generate bootstrapped configurations. ####
+    bs_configs = GEVP.bs_mat(data, no_bs)
 
-    #find unordered eigenvalues and eigenvectors of C_tilde and C_a_tilde
-    C_a_tilde_evals, C_a_tilde_evecs = np.linalg.eigh(C_a_tilde) # shape = (48,10), (48,10,10)
+    #### We now enforce symmetrization upon the correlator matrices.
+    # This is permitted since it is only statistical fluctuations which
+    # casue C(t) to not be symmetric.
+    # Note, GEVP.config_symmetrizer symmetrizes all matrices in a given
+    # configuration. ####
+    symm = np.array([GEVP.config_symmetrizer(x) for x in bs_configs])
 
-    tuple_C_tilde_evals, tuple_C_tilde_evecs = zip(*[np.linalg.eigh(C_tilde[i]) for i in range(no_bs_samples)])
+    #### Fold data across time-slices. ####
+    folding = np.array([GEVP.fold_mats(x) for x in symm])
 
-    #turn tuples into arrays
-    C_tilde_evals = np.array(tuple_C_tilde_evals) # shape = (bs_number, 48, 10)
-    C_tilde_evecs = np.array(tuple_C_tilde_evecs) # shape = (bs_number, 48, 10, 10)
+    #### number of time-slices after folding, will be needed later ####
+    no_ts = len(folding[0])
 
-    #use C_a_tilde(t_0 + 1) as a reference to reorder C_a_tilde(t)'s. 
+    #### Acquire average correlator matrix at time t_0 to use as
+    # reference for later reordering of all C(t_0) eigenvalues and
+    # eigenvectors.
+    C_a_t0 = GEVP.C_a_t0(folding, t_0)
 
-    #first need reordering templates again
-    a_tilde_templates = np.array([GEVP.reordering_template(C_a_tilde[t_0 + 1], C_a_tilde_evecs[i]) for i in range(no_ts)])
+    #### Acquire eigenvalues for C_a_t0 ####
+    C_a_t0_evecs = np.linalg.eigh(C_a_t0)[1]
 
-    #Reorder C_a_tilde_evals and C_a_tilde_evecs
+    #### Acquire eigenvalues and eigenvectors for all C(t_0). These
+    # eigenvalues and eigenvectors will be unordered. ####
+    C_t0_evals, C_t0_evecs = np.linalg.eigh(folding[:, t_0, :, :])
 
-    o_a_tilde_evals_tup, o_a_tilde_evecs_tup = zip(*[GEVP.matrix_reorderer(a_tilde_templates[i], 0
-                                                    , C_a_tilde_evals[i], C_a_tilde_evecs[i]) for i in range(no_ts)])
+    #### Generate the reordering templates to properly order the C(t_0)
+    # eigenvalues and eigenvectors. ####
+    templates = [GEVP.reordering_template(C_a_t0_evecs, x) for x in C_t0_evecs]
 
-    #o_a_tilde_evals = np.array(o_a_tilde_evals_tup) # (48,10)
-    o_a_tilde_evecs = np.array(o_a_tilde_evecs_tup) # (48,10,10)
+    #### Order the C_t0 eigenvalues and eigenvectors using the above
+    # templates. ####
+    o_C_t0_evals, o_C_t0_evecs = zip(
+        *[
+            GEVP.order_mat(templates[i], 0, C_t0_evals[i], C_t0_evecs[i])
+            for i in range(no_bs)
+        ]
+    )
 
-    # Now we use the ordered evals and evecs of C_a_tilde to reorder the evals and evecs of C_tilde at every time slice
-    # again, first need reordering templates
+    #### Construct C_tilde(t) = Sigma^(-1/2) U^T C(t) U Sigma^(-1/2).
+    # First need the Sigma^(-1/2) which we call diag_evals ####
+    inv_sqrt_evals = np.array(o_C_t0_evals) ** (-1 / 2)
+    diag_evals = [np.diag(x) for x in inv_sqrt_evals]
 
-    tilde_templates = np.array([[GEVP.reordering_template(o_a_tilde_evecs[i], C_tilde_evecs[j][i]) 
-                                 for i in range(no_ts)] for j in range(no_bs_samples)]) # (bs_number,48,10,10)
+    C_tilde = [
+        diag_evals[i] @ o_C_t0_evecs[i].T @ folding[i] @ o_C_t0_evecs[i] @ diag_evals[i]
+        for i in range(no_bs)
+    ]
 
-    ordered_eigens = [[GEVP.matrix_reorderer(tilde_templates[j][i], 0, C_tilde_evals[j][i], 
-                                    C_tilde_evecs[j][i]) for i in range(no_ts)] for j in range(no_bs_samples)]
+    #################################################################
+    # First half of GEVP is now done. Now just use the same methods #
+    # to solve the resulting ordinary eigenvalue equation.
+    #################################################################
 
-    o_C_tilde_evals = np.array([[i[0] for i in inner_list] for inner_list in ordered_eigens]) #(bs_number, 48,10)
-    #o_C_tilde_evecs = np.array([[i[1] for i in inner_list] for inner_list in ordered_eigens]) #(bs_number, 48,10,10)
+    #### Find all average C_tilde(t). ####
+    C_a_tilde = np.mean(C_tilde, axis=0)
 
-    # reverse order of C_tilde eigenvalues
+    #### Find unordered eigenvalues and eigenvectors of all
+    # C_a_tilde(t). ####
+    C_a_tilde_evals, C_a_tilde_evecs = np.linalg.eigh(C_a_tilde)
 
+    #### Use C_a_tilde(t_0 + 1) as a reference to reorder
+    # C_a_tilde(t)'s. First will need reordering templates again. ####
+
+    C_a_tilde_temps = [
+        GEVP.reordering_template(C_a_tilde[t_0 + 1], i) for i in C_a_tilde_evecs
+    ]
+
+    #### Reorder C_a_tilde eigenvectors using above templates. ####
+    o_C_a_tilde_evecs = [
+        GEVP.order_mat(C_a_tilde_temps[i], 0, C_a_tilde_evals[i], C_a_tilde_evecs[i])[1]
+        for i in range(no_ts)
+    ]
+
+    #### Find unordered eigenvalues and eigenvectors of all C_tilde(t).
+    C_tilde_evals, C_tilde_evecs = zip(*[np.linalg.eigh(i) for i in C_tilde])
+
+    #### Now we use the ordered C_a_tilde eigenvectors as references to
+    # reorder the all the C_tilde(t) eigenvalues and eigenvectors.
+    # First step is again to generate the templates. ####
+    C_tilde_temps = [
+        [
+            GEVP.reordering_template(o_C_a_tilde_evecs[i], C_tilde_evecs[j][i])
+            for i in range(no_ts)
+        ]
+        for j in range(no_bs)
+    ]
+
+    #### Reorder C_tilde eigenvalues using the above templates. ####
+    o_C_tilde_evals = [
+        [
+            GEVP.order_mat(
+                C_tilde_temps[j][i], 0, C_tilde_evals[j][i], C_tilde_evecs[j][i]
+            )[0]
+            for i in range(no_ts)
+        ]
+        for j in range(no_bs)
+    ]
+
+    #### Reverse order of C_tilde eigenvalues. ####
     return np.flip(o_C_tilde_evals, axis=2)
